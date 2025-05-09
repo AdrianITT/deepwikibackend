@@ -1,0 +1,318 @@
+def get_factura_data(request, factura_id):
+    # Recuperar la factura y traer los objetos relacionados que se usarán.
+    factura = get_object_or_404(
+        Factura.objects.select_related(
+            'ordenTrabajo__receptor',
+            'ordenTrabajo__cotizacion__cliente__empresa__organizacion__RegimenFiscal',
+            'ordenTrabajo__cotizacion__cliente__empresa__regimenFiscal',
+            'ordenTrabajo__cotizacion__cliente__empresa__organizacion__infoSistema',
+            'tipoCfdi',
+            'formaPago',
+            'metodoPago',
+            'ordenTrabajo__cotizacion__iva',
+            'ordenTrabajo__cotizacion__tipoMoneda'
+        ),
+        pk=factura_id
+    )
+    
+    # Obtener los objetos relacionados
+    orden_trabajo = factura.ordenTrabajo
+    cotizacion = orden_trabajo.cotizacion
+    cliente = cotizacion.cliente
+    empresa = cliente.empresa
+    organizacion = empresa.organizacion
+    regimen_fiscal = organizacion.RegimenFiscal
+    organizacionrfc = organizacion.certificadosellodigital_set.first().rfc if organizacion.certificadosellodigital_set.exists() else None
+
+    # Determinar tipo de cambio: si el tipo de moneda es “2” se usa el valor de la organización; de lo contrario, 1.
+    if cotizacion.tipoMoneda.id == 2:
+        tipo_cambio = organizacion.infoSistema.tipoCambioDolar
+    else:
+        tipo_cambio = Decimal(1)
+    rounding = Decimal('0.01')
+
+    fecha_expedicion = factura.fechaExpedicion.isoformat()
+
+    # Armar el diccionario base para el CFDI
+    facturamulti = {
+        "NameId": "1",
+        "LogoUrl": f"https://simplaxi.com/media/{organizacion.logo.url if organizacion.logo else ''}",
+        "Date": fecha_expedicion,
+        "Serie": "FAC",
+        "PaymentAccountNumber": None,
+        "CurrencyExchangeRate": float(tipo_cambio) if cotizacion.tipoMoneda.id == 2 else None,
+        "Currency": cotizacion.tipoMoneda.codigo,  # Se asume un campo 'codigo' en TipoMoneda
+        "ExpeditionPlace": organizacion.codigoPostal,
+        "PaymentConditions": None,
+        "Relations": None,
+        "Folio": factura.id,
+        "CfdiType": factura.tipoCfdi.codigo,       # Se asume que TipoCfdi tiene un campo 'codigo'
+        "PaymentForm": factura.formaPago.codigo,     # idem para FormaPago
+        "PaymentMethod": factura.metodoPago.codigo,  # idem para MetodoPago
+        "Issuer": {
+            "FiscalRegime": regimen_fiscal.codigo if regimen_fiscal else '',
+            "Rfc": organizacionrfc,
+            "Name": organizacion.nombre,
+        },
+        "Receiver": {
+            "Rfc": empresa.rfc,
+            "CfdiUse": empresa.UsoCfdi.codigo if hasattr(empresa, 'UsoCfdi') and empresa.UsoCfdi else '',
+            "Name": empresa.nombre,
+            "FiscalRegime": empresa.regimenFiscal.codigo if empresa.regimenFiscal else '',
+            "TaxZipCode": empresa.codigoPostal,
+        },
+        "Items": [],
+        "Observations": factura.notas,
+        "OrderNumber": factura.ordenCompra,
+    }
+
+    # Calcular factor de descuento de la factura (si existe porcentaje)
+    porcentaje = factura.porcentaje if factura.porcentaje is not None else 0
+    factor = Decimal((100 - porcentaje) / 100).quantize(rounding, rounding=ROUND_HALF_UP)
+
+    # Recuperar los servicios asociados a la orden de trabajo
+    ots_list = OrdenTrabajoServicio.objects.select_related(
+        'servicio__unidadCfdi',
+        'servicio__claveCfdi',
+        'servicio__estado'
+    ).filter(ordenTrabajo=orden_trabajo)
+
+    for ots in ots_list:
+        servicio = ots.servicio
+        # Para cada servicio, se obtiene el precio desde el modelo intermedio de la cotización
+        try:
+            cs = CotizacionServicio.objects.get(cotizacion=cotizacion, servicio=servicio)
+        except CotizacionServicio.DoesNotExist:
+            continue  # O maneja el error según se requiera
+
+        cantidad = Decimal(ots.cantidad)
+        # Ajustar el precio unitario según el tipo de cambio y el factor de descuento
+        precio_unitario = (Decimal(cs.precio) / tipo_cambio * factor).quantize(rounding, rounding=ROUND_HALF_UP)
+        iva = Decimal(cotizacion.iva.porcentaje)
+        descuento = Decimal(cotizacion.descuento) / Decimal(100)
+        subtotal = (precio_unitario * cantidad).quantize(rounding, rounding=ROUND_HALF_UP)
+        descuento_valor = (subtotal * descuento).quantize(rounding, rounding=ROUND_HALF_UP)
+        subtotal_con_descuento = (subtotal - descuento_valor).quantize(rounding, rounding=ROUND_HALF_UP)
+        iva_valor = (subtotal_con_descuento * iva).quantize(rounding, rounding=ROUND_HALF_UP)
+        total = (subtotal_con_descuento + iva_valor).quantize(rounding, rounding=ROUND_HALF_UP)
+
+        item = {
+            "IdProduct": None,
+            "ProductCode": servicio.claveCfdi.codigo,  # Se asume que ClaveCfdi tiene 'codigo'
+            "Description": servicio.nombreServicio,
+            "Unit": "Unidad de servicio.",
+            "UnitCode": servicio.unidadCfdi.codigo,      # Se asume que UnidadCfdi tiene 'codigo'
+            "UnitPrice": float(precio_unitario),
+            "Quantity": float(cantidad),
+            "Subtotal": float(subtotal),
+            "Discount": float(descuento_valor),
+            "TaxObject": "02",
+            "Taxes": [
+                {
+                    "Total": float(iva_valor),
+                    "Name": "IVA",
+                    "Base": float(subtotal_con_descuento),
+                    "Rate": float(iva),
+                    "IsRetention": False
+                }
+            ],
+            "Total": float(total),
+        }
+        facturamulti["Items"].append(item)
+
+    # Crear el CFDI utilizando la función (API) correspondiente
+    response = crear_cfdi_api(facturamulti)
+
+    # Si la respuesta es correcta, guardar el registro de FacturaFacturama
+    if "Id" in response and "Complement" in response and "TaxStamp" in response["Complement"]:
+        FacturaFacturama.objects.create(
+            uuid=response["Complement"]["TaxStamp"]["Uuid"],
+            idfactura=response["Id"],
+            factura_id=factura_id
+        )
+        return JsonResponse({"success": "Factura creada y guardada exitosamente.", "cfdi": response})
+    else:
+        return JsonResponse({"error": "No se pudo crear el CFDI o faltan datos en la respuesta.", "response": response})
+
+
+def get_factura_data(request, factura_id):
+    #permission_classes = [IsAuthenticated]
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT
+                f.fechaExpedicion AS fechaExpedicion,
+                rf.codigo AS regimenFiscal,
+                csdl.rfc AS rfcissuer,
+                org.nombre AS nombreissuer,
+                emp.rfc AS rfcereceiver,
+                emp.nombre AS nombreereceiver,
+                rf_emp.codigo AS regimenFiscal_id,
+                emp.codigoPostal AS codigoPostal,
+                emp.calle AS calle,
+                emp.numero AS numeroExterior,
+                emp.colonia AS colonia,
+                emp.ciudad AS ciudad,
+                emp.estado AS estado,
+                s.nombreServicio AS descripcionproducto,
+                ots.cantidad AS cantidad,
+                cc.codigo AS codigoproducto,
+                ucfdi.codigo AS unidadCfdi_id,
+                cs.precio AS precioUnitario, 
+                iv.porcentaje AS iva_id,
+                c.descuento AS descuento,
+                est.nombre AS estado_servicio,
+                org.logo AS logo,
+                org.codigoPostal as codigopostalorg,
+                uc.codigo AS usoCfdi_id,
+                tc.codigo AS tipoCfdi_id,
+                fp.codigo AS formaPago_id,
+                mp.codigo AS metodoPago_id,
+                f.id AS folio,
+                c.tipoMoneda_id AS tipoMoneda_id,
+                tm.codigo AS codigotipomoneda,
+                infs.tipoCambioDolar AS tipocambio,
+                f.notas AS notas,
+                f.ordenCompra AS numeroOrdenCompra,
+                f.porcentaje AS porcentaje
+            FROM core_factura f
+            LEFT JOIN core_ordentrabajo ot ON f.ordenTrabajo_id = ot.id
+            LEFT JOIN core_receptor r ON ot.receptor_id = r.id
+            LEFT JOIN core_cotizacion c ON ot.cotizacion_id = c.id
+            LEFT JOIN core_ordentrabajoservicio ots ON ot.id = ots.ordenTrabajo_id
+            LEFT JOIN core_servicio s ON ots.servicio_id = s.id
+            LEFT JOIN core_cotizacionservicio cs ON c.id = cs.cotizacion_id AND cs.servicio_id = s.id
+            LEFT JOIN core_iva iv ON c.iva_id = iv.id
+            LEFT JOIN core_unidadcfdi ucfdi ON s.unidadCfdi_id = ucfdi.id
+            LEFT JOIN core_metodos m ON s.metodos_id = m.id
+            LEFT JOIN core_clavecfdi cc ON s.claveCfdi_id = cc.id
+            LEFT JOIN core_objetoimpuesto oi ON s.objetoImpuesto_id = oi.id
+            LEFT JOIN core_estado est ON s.estado_id = est.id
+            LEFT JOIN core_cliente cli ON c.cliente_id = cli.id
+            LEFT JOIN core_empresa emp ON cli.empresa_id = emp.id
+            LEFT JOIN core_regimenfiscal rf_emp ON emp.regimenFiscal_id = rf_emp.id
+            LEFT JOIN core_organizacion org ON emp.organizacion_id = org.id
+            LEFT JOIN core_regimenfiscal rf ON org.RegimenFiscal_id = rf.id
+            LEFT JOIN core_certificadosellodigital csdl ON org.id = csdl.Organizacion_id
+            LEFT JOIN core_usocfdi uc ON emp.usocfdi_id = uc.id
+            LEFT JOIN core_tipocfdi tc ON f.tipoCfdi_id = tc.id
+            LEFT JOIN core_formapago fp ON f.formaPago_id = fp.id
+            LEFT JOIN core_metodopago mp ON f.metodoPago_id = mp.id
+            LEFT JOIN core_infosistema infs ON org.infosistema_id = infs.id
+            LEFT JOIN core_tipomoneda tm ON c.tipoMoneda_id = tm.id
+            WHERE f.id = %s
+        """, [factura_id])
+        rows = cursor.fetchall()  # Obtener todas las filas
+
+        if not rows:
+            return JsonResponse({"error": "No se encontraron datos para la factura especificada."})
+
+        # Obtener información general de la factura (de la primera fila)
+        fecha_expedicion = rows[0][0].isoformat() if hasattr(rows[0][0], 'isoformat') else str(rows[0][0])
+        fecha_expedicion_datetime = rows[0][0].isoformat() if hasattr(rows[0][0], 'date') else fecha_expedicion
+    
+        tipo_cambio = Decimal(rows[0][30]) if rows[0][28] == 2 else Decimal(1)
+        rounding = Decimal('0.01')
+
+        facturamulti = {
+            "NameId": "1",
+            "LogoUrl": "https://simplaxi.com/media/" + rows[0][21],  # logo
+            "Date": fecha_expedicion_datetime,
+            "Serie": "FAC",
+            "PaymentAccountNumber": None,
+            "CurrencyExchangeRate": float(tipo_cambio) if rows[0][28] == 2 else None,
+            "Currency": rows[0][29],  # codigotipomoneda
+            "ExpeditionPlace": rows[0][22],  # codigopostalorg
+            "PaymentConditions": None,
+            "Relations": None,
+            "Folio": rows[0][27],  # folio
+            "CfdiType": rows[0][24],  # tipoCfdi_id
+            "PaymentForm": rows[0][25],  # formaPago_id
+            "PaymentMethod": rows[0][26],  # metodoPago_id
+            "Issuer": {
+                "FiscalRegime": rows[0][1],  # regimenFiscal
+                "Rfc": rows[0][2],  # rfcissuer
+                "Name": rows[0][3]  # nombreissuer
+            },
+            "Receiver": {
+                'Rfc': rows[0][4],  # rfcereceiver
+                'CfdiUse': rows[0][23],  # usoCfdi_id
+                'Name': rows[0][5],  # nombreereceiver
+                'FiscalRegime': rows[0][6],  # regimenFiscal_id
+                'TaxZipCode': rows[0][7]  # codigoPostal
+            },
+            "Items": [],  # Lista vacía para los servicios
+            "Observations": rows[0][31],  # notas
+            "OrderNumber": rows[0][32]  # numeroOrdenCompra
+        }
+
+        porcentaje = rows[0][33]
+        factor = Decimal((100 - porcentaje) / 100).quantize(rounding, rounding=ROUND_HALF_UP)
+
+        for row in rows:
+            cantidad = Decimal(row[14])
+            precio_unitario = ((Decimal(row[17]) / tipo_cambio) * factor).quantize(rounding, rounding=ROUND_HALF_UP)
+            iva = Decimal(row[18])
+            descuento = Decimal(row[19]) / Decimal(100)
+
+            subtotal = (precio_unitario * cantidad).quantize(rounding, rounding=ROUND_HALF_UP)
+            descuento_valor = (subtotal * descuento).quantize(rounding, rounding=ROUND_HALF_UP)
+            subtotal_con_descuento = (subtotal - descuento_valor).quantize(rounding, rounding=ROUND_HALF_UP)
+            iva_valor = (subtotal_con_descuento * iva).quantize(rounding, rounding=ROUND_HALF_UP)
+            total = (subtotal_con_descuento + iva_valor).quantize(rounding, rounding=ROUND_HALF_UP)
+
+            item = {
+                "IdProduct": None,
+                "ProductCode": row[15],
+                "Description": row[13],
+                "Unit": "Unidad de servicio.",
+                "UnitCode": row[16],
+                "UnitPrice": float(precio_unitario),
+                "Quantity": float(cantidad),
+                "Subtotal": float(subtotal),
+                "Discount": float(descuento_valor),
+                "TaxObject": "02",
+                "Taxes": [
+                    {
+                        "Total": float(iva_valor),
+                        "Name": "IVA",
+                        "Base": float(subtotal_con_descuento),
+                        "Rate": float(iva),
+                        "IsRetention": False
+                    }
+                ],
+                "Total": float(total),
+            }
+            facturamulti["Items"].append(item)
+
+
+        # Crear el CFDI usando la API de Facturama
+        response = crear_cfdi_api(facturamulti)
+
+        if "Id" in response and "Complement" in response and "TaxStamp" in response["Complement"]:
+            # Crear un registro en FacturaFacturama
+            FacturaFacturama.objects.create(
+                uuid=response["Complement"]["TaxStamp"]["Uuid"],
+                idfactura=response["Id"],
+                factura_id=factura_id  # Relación con la tabla Factura
+            )
+            return JsonResponse({"success": "Factura creada y guardada exitosamente.", "cfdi": response})
+
+        return JsonResponse({"error": "No se pudo crear el CFDI o faltan datos en la respuesta.", "response": response})
+
+
+(EDITAR DESCRIPCION EN ORDEN DE TRABAJO, GENERAR ERROR EN LOS PRECIOS, BUSCAR SOLUCON O BLOQUEARLO)
+Lista Simplaxi
+1. Quitar el numero de la precotizacion en el PDF
+2. Poder eliminar facturas que no sean mandadas a Facturama
+3. En OT en "Agregar receptor" quitar la informacion que sea obligatoria
+4. Scroll del mouse
+5. En clientes rellenar automatico la direccion y que sea editable
+6. Que se pueda ver el metodo del servicio en la cotizacion
+7. Que no se quiten los conceptos al editar cotizacion u Orden de trabajo
+8. Factura y orden de trabajo
+9. Orden de trabajo
+10. En cliente agregar una subdivision(FALTA AGREGARLO AL PDF DE COTIZACION Y ORDEN DE TRABAJO)
+11. Orden de trabajo direccion cliente
+12 EN facturas que se desglosen los conceptos
+13. Poder editar pre-cotizacion
+14. Poder editar orden de trabajo
